@@ -1,0 +1,9 @@
+fastapi==0.104.1
+uvicorn==0.24.0
+httpx==0.25.2
+hvac==1.2.1
+psycopg2-binary==2.9.9
+python-dotenv==1.0.0
+base58==2.1.1
+cryptography==41.0.7
+pydantic==2.5.0

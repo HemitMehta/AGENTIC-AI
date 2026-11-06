@@ -1,0 +1,841 @@
+services:
+  
+  # Infrastructure
+  
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - zero-trust
+
+  postgres:
+    image: postgres:15-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init_databases.sh:/docker-entrypoint-initdb.d/init_databases.sh
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - zero-trust
+
+  # Idempotent migration helper for existing volumes created before Layer 3.
+  layer3_db_init:
+    image: postgres:15-alpine
+    environment:
+      - PGPASSWORD=password
+    command:
+      - sh
+      - -c
+      - >-
+        if ! psql -h postgres -U user -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='layer3'" | grep -q 1;
+        then psql -h postgres -U user -d postgres -c "CREATE DATABASE layer3"; fi
+    networks:
+      - zero-trust
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  
+  vault:
+    image: hashicorp/vault:1.15
+    ports:
+      - "8200:8200"
+    environment:
+      - VAULT_DEV_ROOT_TOKEN_ID=root
+      - VAULT_DEV_LISTEN_ADDRESS=0.0.0.0:8200
+      - VAULT_ADDR=http://127.0.0.1:8200
+    cap_add:
+      - IPC_LOCK
+    healthcheck:
+      test:
+        - "CMD"
+        - "sh"
+        - "-c"
+        - "VAULT_ADDR=http://127.0.0.1:8200 vault status"
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - zero-trust
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "kafka:29092"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - zero-trust
+    depends_on:
+      - zookeeper
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD", "echo", "ruok", "|", "nc", "localhost", "2181"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - zero-trust
+
+
+  
+  # SS1: Key Management Service
+  
+
+  kms:
+    build:
+      context: .
+      dockerfile: Dockerfile.kms
+    ports:
+      - "8001:8001"
+    environment:
+     
+      - VAULT_ADDR=http://vault:8200
+      - VAULT_TOKEN=root
+      - ENVIRONMENT=development
+      - ROOT_TRUST_KEY_ID=root-trust-anchor-key
+      - KMS_BOOTSTRAP_KEY_IDS=root-trust-anchor-key,status-list-signing-key,ans-resolver-signing-key,discovery-gateway-signing-key,reputation-service-key,governance-admin-signing-key,layer3-pep-signing-key,task-orchestrator-signing-key,risk-analyzer-signing-key
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8001/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - zero-trust
+    depends_on:
+      vault:
+        condition: service_healthy
+
+
+  
+  # SS2: DID Registry Service
+  
+  did_registry:
+    build:
+      context: .
+      dockerfile: Dockerfile.did_registry
+    ports:
+      - "8002:8002"
+    environment:
+      - CRDB_HOST=postgres
+      - CRDB_PORT=5432
+      - CRDB_DB=did_registry
+      - CRDB_USER=user
+      - CRDB_PASSWORD=password
+      - CRDB_SSLMODE=disable
+      - ENVIRONMENT=development
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8002/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - zero-trust
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+
+  
+  # SS3: Root Trust Anchor Service
+  
+
+  trust_anchor:
+    build:
+      context: .
+      dockerfile: Dockerfile.trust_anchor
+    ports:
+      - "8003:8003"
+    environment:
+      - CRDB_HOST=postgres
+      - CRDB_PORT=5432
+      - CRDB_DB=trust_anchors
+      - CRDB_USER=user
+      - CRDB_PASSWORD=password
+      - CRDB_SSLMODE=disable
+      - ENVIRONMENT=development
+      # FIX: root_trust.py calls load_dotenv() at import time, and .env
+      # has DID_REGISTRY_URL/KMS_URL pointing at localhost (for local dev
+      # outside Docker). Without these explicitly set here, Docker never
+      # pre-populates them, so dotenv's localhost values leak through --
+      # causing "Connection refused" since localhost inside this
+      # container refers to trust_anchor itself, not did_registry/kms.
+      - DID_REGISTRY_URL=http://did_registry:8002
+      - KMS_URL=http://kms:8001
+      - ROOT_TRUST_KEY_ID=root-trust-anchor-key
+      - TRUST_ANCHOR_ADMIN_DIDS=did:web:demo.local:agents:governance-admin
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8003/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - zero-trust
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+
+  
+  # SS4: VC Issuance Service
+  
+  vc_issuance:
+    build:
+      context: .
+      dockerfile: Dockerfile.vc_issuance
+    ports:
+      - "8004:8004"
+    environment:
+      - CRDB_HOST=postgres
+      - CRDB_PORT=5432
+      - CRDB_DB=vc_issuance
+      - CRDB_USER=user
+      - CRDB_PASSWORD=password
+      - CRDB_SSLMODE=disable
+      - ENVIRONMENT=development
+      # FIX: vc_issuance.py imports kms.py, did.py, and root_trust.py
+      # directly and runs them IN-PROCESS (not over HTTP) -- Dockerfile.vc_issuance
+      # copies the whole repo root into this image. Without these,
+      # each in-process module either reads the wrong database (since
+      # CRDB_DB above is scoped to vc_issuance's OWN needs) or falls
+      # back to .env's localhost Vault address, which is unreachable
+      # from inside this container.
+      - TRUST_ANCHOR_CRDB_DB=trust_anchors
+      - DID_REGISTRY_CRDB_DB=did_registry
+      - VAULT_ADDR=http://vault:8200
+      - VAULT_TOKEN=root
+      # FIX: status_list.py (imported in-process, same reasoning as above)
+      # was a leftover copy of status_list_stub.py that never actually
+      # called the real status_list_service -- every issued VC got a
+      # hardcoded, unreachable placeholder credentialStatus URL, which
+      # made every revocation check during verification fail. Now a real
+      # HTTP client; needs to know where status_list_service actually is.
+      - STATUS_LIST_SERVICE_URL=http://status_list_service:8006
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8004/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - zero-trust
+    depends_on:
+      postgres:
+        condition: service_healthy
+      vault:
+        condition: service_healthy
+      kms:
+        condition: service_healthy
+      did_registry:
+        condition: service_healthy
+      status_list_service:
+        condition: service_healthy
+      trust_anchor:
+        condition: service_healthy
+
+
+  
+  # SS5: VC Verification Service
+  
+
+  vc_verification:
+    build:
+      context: ./verification_service
+      dockerfile: Dockerfile
+    ports:
+      - "8005:8005"
+    environment:
+      - VERIFICATION_SERVICE_PORT=8005
+      - REDIS_URL=redis://redis:6379
+      - NONCE_TTL_SECONDS=300
+      - STATUS_CACHE_TTL=30
+      - ENVIRONMENT=development
+      
+      - KMS_URL=http://kms:8001
+      - DID_REGISTRY_URL=http://did_registry:8002
+      - TRUST_ANCHOR_URL=http://trust_anchor:8003
+      - STATUS_LIST_BASE_URL=http://status_list_service:8006
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8005/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - zero-trust
+    depends_on:
+      redis:
+        condition: service_healthy
+      vc_issuance:
+        condition: service_healthy
+      trust_anchor:
+        condition: service_healthy
+      status_list_service:
+        condition: service_healthy
+
+
+  
+  # SS6: Status List Service (Revocation Infrastructure)
+  
+
+  status_list_service:
+    build:
+      context: ./status_list_service
+      dockerfile: Dockerfile
+    ports:
+      - "8006:8006"
+    environment:
+      - STATUS_LIST_SERVICE_PORT=8006
+      - STATUS_LIST_BASE_URL=http://status_list_service:8006
+      - STATUS_CACHE_TTL=30
+      - REDIS_URL=redis://redis:6379
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - DATABASE_URL=postgresql+asyncpg://user:password@postgres:5432/revocation
+      - CASCADE_MAX_RETRIES=3
+      - CASCADE_RETRY_BASE_SECONDS=1
+      - ENVIRONMENT=development
+      # Status list needs to call DID registry and KMS during cascade
+      - KMS_URL=http://kms:8001
+      - DID_REGISTRY_URL=http://did_registry:8002
+      - KMS_STATUS_LIST_KEY_ID=status-list-signing-key
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8006/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - zero-trust
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kms:
+        condition: service_healthy
+      did_registry:
+        condition: service_healthy
+
+
+  
+  # SS7: Wallet Service
+  
+
+  wallet_service:
+    build:
+      context: ./wallet_service
+      dockerfile: Dockerfile
+    ports:
+      - "8007:8007"
+    environment:
+      - WALLET_SERVICE_PORT=8007
+      - DATABASE_URL=postgresql+asyncpg://user:password@postgres:5432/wallets
+      - CIRCUITS_BASE_PATH=./circuits
+      - NODE_BINARY=node
+      - BBS_SCRIPT_PATH=./bbs_derive_proof.js
+      - SNARK_TIMEOUT_SECONDS=30
+      - BBS_TIMEOUT_SECONDS=10
+      - HKDF_ITERATIONS=1
+      - ENVIRONMENT=development
+     
+      - KMS_URL=http://kms:8001
+      - DID_REGISTRY_URL=http://did_registry:8002
+      - VC_ISSUANCE_URL=http://vc_issuance:8004
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8007/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - zero-trust
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kms:
+        condition: service_healthy
+      did_registry:
+        condition: service_healthy
+      vc_issuance:
+        condition: service_healthy
+
+
+  
+  # Layer 2 / SS8: ANS Registry Service (Person A, Module 1)
+  
+
+  ans_registry_service:
+    build:
+      context: ./ans_registry_service
+      dockerfile: Dockerfile
+    ports:
+      - "8008:8008"
+    environment:
+      - DID_REGISTRY_URL=http://did_registry:8002
+      - DID_RESOLVE_TIMEOUT_SECONDS=5
+      - ANS_REQUIRE_REGISTRATION_PROOF=true
+      - LAYER2_DATABASE_URL=postgresql://user:password@postgres:5432/layer2
+      - ENVIRONMENT=development
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8008/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - zero-trust
+    depends_on:
+      did_registry:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+
+  
+  # Layer 2 / SS9: ANS Resolver Service (Person B, Module 2)
+  # Queries the ANS Registry for capability matches, verifies each
+  # candidate's VCs against Layer 1 (vc_verification / status_list_service),
+  # then signs the resolution response via KMS.
+  
+
+  ans_resolver_service:
+    build:
+      context: ./ans_resolver_service
+      dockerfile: Dockerfile
+    ports:
+      - "8009:8009"
+    environment:
+      - ANS_REGISTRY_URL=http://ans_registry_service:8008
+      - VC_VERIFICATION_URL=http://vc_verification:8005
+      - WALLET_SERVICE_URL=http://wallet_service:8007
+      - KMS_URL=http://kms:8001
+      - ANS_RESOLVER_SIGNING_KEY_ID=ans-resolver-signing-key
+      - ANS_RESOLVER_VERIFIER_DID=did:web:layer2:ans-resolver
+      - DOWNSTREAM_TIMEOUT_SECONDS=5
+      - ENVIRONMENT=development
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8009/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - zero-trust
+    depends_on:
+      ans_registry_service:
+        condition: service_healthy
+      vc_verification:
+        condition: service_healthy
+      wallet_service:
+        condition: service_healthy
+      kms:
+        condition: service_healthy
+
+
+  
+  # Layer 2 / SS10: Discovery Trust Policy Service (Person A, Module 3)
+  
+
+  discovery_trust_policy_service:
+    build:
+      context: ./discovery_trust_policy_service
+      dockerfile: Dockerfile
+    ports:
+      - "8010:8010"
+    environment:
+      - LAYER2_DATABASE_URL=postgresql://user:password@postgres:5432/layer2
+      - ENVIRONMENT=development
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8010/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - zero-trust
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+
+  
+  # Layer 2 / SS11: Reputation Service (Person B, Module 4)
+  # Write side wraps vc_issuance to mint Reputation VCs; read side
+  # aggregates/returns a reputation score for a given agent DID.
+  
+
+  reputation_service:
+    build:
+      context: ./reputation_service
+      dockerfile: Dockerfile
+    ports:
+      - "8011:8011"
+    environment:
+      - VC_ISSUANCE_URL=http://vc_issuance:8004
+      - VC_ISSUANCE_TIMEOUT_SECONDS=5
+      - LAYER2_DATABASE_URL=postgresql://user:password@postgres:5432/layer2
+      - REPUTATION_ISSUER_DID=did:web:layer2:reputation-service
+      - REPUTATION_ISSUER_KEY_ID=reputation-service-key
+      - REPUTATION_VC_TRUST_DOMAIN=enterprise
+      - ENVIRONMENT=development
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8011/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - zero-trust
+    depends_on:
+      vc_issuance:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+
+  
+  # Layer 2 / SS12: Discovery Gateway (Shared, Module 5)
+  # Single external entry point for Layer 3: Trust Policy check -> ANS
+  # Resolver query -> Reputation lookup -> signs and returns the unified,
+  # verified, ranked agent record.
+  
+
+  discovery_gateway:
+    build:
+      context: ./discovery_gateway
+      dockerfile: Dockerfile
+    ports:
+      - "8012:8012"
+    environment:
+      - TRUST_POLICY_URL=http://discovery_trust_policy_service:8010
+      - ANS_RESOLVER_URL=http://ans_resolver_service:8009
+      - REPUTATION_SERVICE_URL=http://reputation_service:8011
+      - KMS_URL=http://kms:8001
+      - GATEWAY_SIGNING_KEY_ID=discovery-gateway-signing-key
+      - DOWNSTREAM_TIMEOUT_SECONDS=5
+      - ENVIRONMENT=development
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8012/health', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - zero-trust
+    depends_on:
+      ans_registry_service:
+        condition: service_healthy
+      ans_resolver_service:
+        condition: service_healthy
+      discovery_trust_policy_service:
+        condition: service_healthy
+      reputation_service:
+        condition: service_healthy
+
+  # Layer 3 uses its own TLS-protected database and per-service credentials.
+  layer3_security_init:
+    build:
+      context: .
+      dockerfile: layer3_common/Dockerfile
+    command: ["python", "-m", "layer3_common.provision"]
+    volumes:
+      - ./layer3_testing/runtime/security:/state
+
+  layer3_postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: layer3
+      POSTGRES_PASSWORD_FILE: /run/bootstrap/database.key
+    command:
+      - sh
+      - -c
+      - >-
+        cp /run/bootstrap/tls.key /tmp/postgres-tls.key &&
+        chown postgres:postgres /tmp/postgres-tls.key &&
+        chmod 600 /tmp/postgres-tls.key &&
+        cp /run/bootstrap/init.sql /docker-entrypoint-initdb.d/10-roles.sql &&
+        chown postgres:postgres /docker-entrypoint-initdb.d/10-roles.sql &&
+        chmod 600 /docker-entrypoint-initdb.d/10-roles.sql &&
+        exec docker-entrypoint.sh postgres -c ssl=on
+        -c ssl_cert_file=/run/bootstrap/tls.crt -c ssl_key_file=/tmp/postgres-tls.key
+        -c hba_file=/run/bootstrap/pg_hba.conf
+    volumes:
+      - layer3_data:/var/lib/postgresql/data
+      - ./layer3_testing/runtime/security/database:/run/bootstrap:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres", "-d", "layer3"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    networks:
+      - zero-trust
+    depends_on:
+      layer3_security_init:
+        condition: service_completed_successfully
+
+  policy_administration_service:
+    build:
+      context: .
+      dockerfile: layer3_common/Dockerfile
+    ports:
+      - "127.0.0.1:8013:8013"
+    environment:
+      - SERVICE_MODULE=policy_administration_service.main:app
+      - SERVICE_PORT=8013
+      - LAYER3_SERVICE_ID=pap
+      - DOWNSTREAM_TIMEOUT_SECONDS=30
+      - DID_REGISTRY_URL=http://did_registry:8002
+      - LAYER3_ADMIN_DIDS=did:web:demo.local:agents:governance-admin
+    volumes:
+      - ./layer3_testing/runtime/security/pap:/run/layer3:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('https://localhost:8013/health', verify='/run/layer3/ca.crt', timeout=2).raise_for_status()"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    networks:
+      - zero-trust
+    depends_on:
+      layer3_security_init:
+        condition: service_completed_successfully
+      layer3_postgres:
+        condition: service_healthy
+      did_registry:
+        condition: service_healthy
+
+  policy_information_service:
+    build:
+      context: .
+      dockerfile: layer3_common/Dockerfile
+    ports:
+      - "127.0.0.1:8014:8014"
+    environment:
+      - SERVICE_MODULE=policy_information_service.main:app
+      - SERVICE_PORT=8014
+      - LAYER3_SERVICE_ID=pip
+      - DOWNSTREAM_TIMEOUT_SECONDS=30
+      - DID_REGISTRY_URL=http://did_registry:8002
+      - VC_VERIFICATION_URL=http://vc_verification:8005
+      - PAP_URL=https://policy_administration_service:8013
+      - PDP_VERIFIER_DID=did:web:layer3:pdp
+    volumes:
+      - ./layer3_testing/runtime/security/pip:/run/layer3:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('https://localhost:8014/health', verify='/run/layer3/ca.crt', timeout=2).raise_for_status()"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    networks:
+      - zero-trust
+    depends_on:
+      layer3_security_init:
+        condition: service_completed_successfully
+      vc_verification:
+        condition: service_healthy
+      policy_administration_service:
+        condition: service_healthy
+
+  policy_decision_service:
+    build:
+      context: .
+      dockerfile: layer3_common/Dockerfile
+    ports:
+      - "127.0.0.1:8015:8015"
+    environment:
+      - SERVICE_MODULE=policy_decision_service.main:app
+      - SERVICE_PORT=8015
+      - LAYER3_SERVICE_ID=pdp
+      - DOWNSTREAM_TIMEOUT_SECONDS=30
+      - PAP_URL=https://policy_administration_service:8013
+      - PIP_URL=https://policy_information_service:8014
+    volumes:
+      - ./layer3_testing/runtime/security/pdp:/run/layer3:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('https://localhost:8015/health', verify='/run/layer3/ca.crt', timeout=2).raise_for_status()"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    networks:
+      - zero-trust
+    depends_on:
+      layer3_security_init:
+        condition: service_completed_successfully
+      policy_administration_service:
+        condition: service_healthy
+      policy_information_service:
+        condition: service_healthy
+
+  access_control_service:
+    build:
+      context: .
+      dockerfile: layer3_common/Dockerfile
+    ports:
+      - "127.0.0.1:8016:8016"
+    environment:
+      - SERVICE_MODULE=access_control_service.main:app
+      - SERVICE_PORT=8016
+      - LAYER3_SERVICE_ID=pep
+      - DOWNSTREAM_TIMEOUT_SECONDS=30
+      - PDP_URL=https://policy_decision_service:8015
+      - KMS_URL=http://kms:8001
+      - PEP_SIGNING_KEY_ID=layer3-pep-signing-key
+      - ACCESS_TOKEN_TTL_SECONDS=120
+    volumes:
+      - ./layer3_testing/runtime/security/pep:/run/layer3:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('https://localhost:8016/health', verify='/run/layer3/ca.crt', timeout=2).raise_for_status()"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    networks:
+      - zero-trust
+    depends_on:
+      layer3_security_init:
+        condition: service_completed_successfully
+      layer3_postgres:
+        condition: service_healthy
+      kms:
+        condition: service_healthy
+      policy_decision_service:
+        condition: service_healthy
+
+  protected_sales_service:
+    build:
+      context: .
+      dockerfile: layer3_common/Dockerfile
+    ports:
+      - "127.0.0.1:8019:8019"
+    environment:
+      - SERVICE_MODULE=protected_sales_service.main:app
+      - SERVICE_PORT=8019
+      - LAYER3_SERVICE_ID=sales
+      - DOWNSTREAM_TIMEOUT_SECONDS=30
+      - PEP_URL=https://access_control_service:8016
+      - DID_REGISTRY_URL=http://did_registry:8002
+      - LAYER3_ADMIN_DIDS=did:web:demo.local:agents:governance-admin
+    volumes:
+      - ./layer3_testing/runtime/security/sales:/run/layer3:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('https://localhost:8019/health', verify='/run/layer3/ca.crt', timeout=2).raise_for_status()"]
+      interval: 5s
+      timeout: 3s
+      retries: 15
+    networks:
+      - zero-trust
+    depends_on:
+      layer3_security_init:
+        condition: service_completed_successfully
+      layer3_postgres:
+        condition: service_healthy
+      access_control_service:
+        condition: service_healthy
+
+  task_orchestrator:
+    build: ./agent_services
+    ports:
+      - "127.0.0.1:8017:8017"
+    environment:
+      - AGENT_KEY_ID=task-orchestrator-signing-key
+      - AGENT_DID_DOMAIN=demo.local
+      - KMS_URL=http://kms:8001
+      - DID_REGISTRY_URL=http://did_registry:8002
+      - DISCOVERY_GATEWAY_URL=http://discovery_gateway:8012
+      - TRUSTED_GATEWAY_KEY_ID=discovery-gateway-signing-key
+      - TRUSTED_RESOLVER_KEY_ID=ans-resolver-signing-key
+      - ALLOWED_AGENT_ENDPOINTS=http://risk_analyzer:8018/tasks
+      # HTTP is for this isolated local Docker network, not production.
+      - ALLOW_HTTP_AGENT_ENDPOINTS=true
+    volumes:
+      - ./agent_testing/runtime/orchestrator:/state
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8017/health', timeout=2).raise_for_status()"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - zero-trust
+    depends_on:
+      kms:
+        condition: service_healthy
+      did_registry:
+        condition: service_healthy
+      discovery_gateway:
+        condition: service_healthy
+
+  risk_analyzer:
+    build: ./agent_services
+    command: ["uvicorn", "agent_services.risk_agent:app", "--host", "0.0.0.0", "--port", "8018"]
+    ports:
+      - "127.0.0.1:8018:8018"
+    environment:
+      - AGENT_KEY_ID=risk-analyzer-signing-key
+      - TRUSTED_ORCHESTRATOR_KEY_ID=task-orchestrator-signing-key
+      - AGENT_DID_DOMAIN=demo.local
+      - AGENT_CAPABILITY=FinancialRiskAnalysis.CorporateReporting
+      - AGENT_PROVIDER=DemoProvider
+      - AGENT_SERVICE_ENDPOINT=http://risk_analyzer:8018/tasks
+      - PEP_URL=https://access_control_service:8016
+      - PROTECTED_SALES_URL=https://protected_sales_service:8019
+      - VC_VERIFICATION_URL=http://vc_verification:8005
+      - TRUSTED_PEP_KEY_ID=layer3-pep-signing-key
+      - KMS_URL=http://kms:8001
+      - DID_REGISTRY_URL=http://did_registry:8002
+      - WALLET_SERVICE_URL=http://wallet_service:8007
+    volumes:
+      - ./agent_testing/runtime/risk_analyzer:/state
+      - ./layer3_testing/runtime/security/risk_agent:/run/layer3:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:8018/health', timeout=2).raise_for_status()"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - zero-trust
+    depends_on:
+      kms:
+        condition: service_healthy
+      did_registry:
+        condition: service_healthy
+      wallet_service:
+        condition: service_healthy
+      layer3_security_init:
+        condition: service_completed_successfully
+      protected_sales_service:
+        condition: service_healthy
+
+volumes:
+  layer3_data:
+    driver: local
+  postgres_data:
+    driver: local
+
+networks:
+  zero-trust:
+    driver: bridge

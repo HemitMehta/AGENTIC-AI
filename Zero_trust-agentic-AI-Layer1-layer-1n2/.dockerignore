@@ -1,0 +1,13 @@
+cockroach-data/
+.git/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.pyo
+.env.local
+.DS_Store
+*.db
+agent_testing/runtime/
+layer3_testing/runtime/
+layer3_testing/swagger_demo/
+agent_testing/swagger_demo/

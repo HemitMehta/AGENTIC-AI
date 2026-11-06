@@ -1,0 +1,59 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Packaging and build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Test and coverage artifacts
+/layer3_testing/swagger_demo/
+/layer3_testing/runtime/
+/agent_testing/runtime/
+/agent_testing/swagger_demo/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+
+# Environment and local configuration
+.env
+.env.*
+!.env.example
+
+# Logs and runtime output
+*.log
+logs/
+
+# Local databases and state
+*.db
+*.sqlite
+*.sqlite3
+
+# Repository runtime data directories
+cockroach-data/
+
+# Docker override/local files
+docker-compose.override.yml
+
+# IDE/editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db

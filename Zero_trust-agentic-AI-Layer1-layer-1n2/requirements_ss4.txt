@@ -1,0 +1,12 @@
+# Sub-System 4: VC Issuance Service
+# Install: pip install -r requirements_ss4.txt --break-system-packages
+
+# Already required by Person A (must be installed):
+psycopg2-binary>=2.9
+python-dotenv>=1.0
+hvac>=1.2
+base58>=2.1
+
+# New for SS4:
+pytest>=7.4
+pytest-mock>=3.12
